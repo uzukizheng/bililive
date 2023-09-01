@@ -8,7 +8,7 @@ import (
 
 func main() {
 	live := &bililive.Live{
-		//Debug:       true,
+		Debug:       true,
 		StormFilter: true, // 过滤节奏风暴弹幕
 		Raw: func(roomID int, msg []byte) {
 			fmt.Println(roomID, string(msg))
@@ -19,6 +19,6 @@ func main() {
 	}
 
 	live.Start(context.Background())
-	_ = live.Join(27732004)
+	_ = live.Join(26082518)
 	live.Wait()
 }

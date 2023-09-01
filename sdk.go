@@ -4,17 +4,20 @@ import (
 	"bytes"
 	"compress/zlib"
 	"context"
+	"encoding/base64"
 	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"github.com/andybalholm/brotli"
+	"github.com/gorilla/websocket"
 	uuid "github.com/satori/go.uuid"
 	"github.com/spf13/cast"
 	"io"
 	"log"
 	"math/rand"
 	"net"
+	"net/http"
 	"regexp"
 	"strconv"
 	"strings"
@@ -25,6 +28,7 @@ import (
 const (
 	roomInitURL                    string = "https://api.live.bilibili.com/room/v1/Room/room_init?id=%d"
 	roomConfigURL                  string = "https://api.live.bilibili.com/room/v1/Danmu/getConf?room_id=%d"
+	danmuConfigURL                 string = "https://api.live.bilibili.com/xlive/web-room/v1/index/getDanmuInfo?id=%d&type=0"
 	WS_OP_HEARTBEAT                int32  = 2
 	WS_OP_HEARTBEAT_REPLY          int32  = 3
 	WS_OP_MESSAGE                  int32  = 5
@@ -45,6 +49,8 @@ const (
 	WS_AUTH_OK                 int32 = 0
 	WS_AUTH_TOKEN_ERROR        int32 = -101
 )
+
+var heartPacket, _ = base64.StdEncoding.DecodeString("AAAAHwAQAAEAAAACAAAAAVtvYmplY3QgT2JqZWN0XQ==")
 
 var ret = regexp.MustCompile("<%(.*?)%>")
 
@@ -99,13 +105,12 @@ func (live *Live) Join(roomIDs ...int) error {
 
 	for _, roomID := range roomIDs {
 		nextCtx, cancel := context.WithCancel(live.ctx)
-
 		room := &liveRoom{
 			roomID: roomID,
 			cancel: cancel,
 		}
 		live.room[roomID] = room
-		room.enter()
+		room.createConnect()
 		go room.heartBeat(nextCtx)
 		live.stormContent[roomID] = make(map[int64]string)
 		go room.receive(nextCtx, live.chSocketMessage)
@@ -152,9 +157,14 @@ func (live *Live) split(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case message = <-live.chSocketMessage:
+			fmt.Println("message", message.roomID, len(message.body))
 			for len(message.body) > 0 {
 				headerBufferReader = bytes.NewReader(message.body[:WS_PACKAGE_HEADER_TOTAL_LENGTH])
 				_ = binary.Read(headerBufferReader, binary.BigEndian, &head)
+				if int(head.Length) > len(message.body) {
+					log.Println(head.Length, len(message.body), string(message.body))
+					break
+				}
 				payloadBuffer = message.body[WS_PACKAGE_HEADER_TOTAL_LENGTH:head.Length]
 				message.body = message.body[head.Length:]
 				if head.Length == WS_PACKAGE_HEADER_TOTAL_LENGTH {
@@ -426,21 +436,27 @@ func (room *liveRoom) findServer() error {
 	}
 	room.realRoomID = roomInfo.Data.RoomID
 	room.uid = roomInfo.Data.UID
-	resDanmuConfig, err := httpSend(fmt.Sprintf(roomConfigURL, room.realRoomID))
+	resDanmuConfig, err := httpSend(fmt.Sprintf(danmuConfigURL, room.realRoomID))
 	if err != nil {
 		return err
 	}
 
-	danmuConfig := danmuConfigResult{}
+	danmuConfig := danmuServerV2Resp{}
 	_ = json.Unmarshal(resDanmuConfig, &danmuConfig)
-	if danmuConfig.Data == nil {
+	if danmuConfig.Code != 0 {
 		return errors.New("获取弹幕服务器失败")
 	}
-	room.server = danmuConfig.Data.Host
-	room.port = danmuConfig.Data.Port
-	// 可着一个先薅着
-	serverList := []*hostServerList{&hostServerList{Host: "hw-gz-live-comet-02.chat.bilibili.com", Port: 2243, WssPort: 443, WsPort: 2244}}
-	serverList = append(serverList, danmuConfig.Data.HostServerList...)
+	//room.server = danmuConfig.Data.Host
+	//room.port = danmuConfig.Data.Port
+	serverList := []*hostServerList{}
+	for _, server := range danmuConfig.Data.HostList {
+		serverList = append(serverList, &hostServerList{
+			Host:    server.Host,
+			Port:    server.Port,
+			WssPort: server.WssPort,
+			WsPort:  server.WsPort,
+		})
+	}
 	room.hostServerList = serverList
 	room.token = danmuConfig.Data.Token
 	room.currentServerIndex = 0
@@ -462,8 +478,17 @@ func (room *liveRoom) createConnect() {
 		}
 		counter := 0
 		for {
-			log.Println("尝试创建连接：", room.hostServerList[room.currentServerIndex].Host, room.hostServerList[room.currentServerIndex].Port)
-			conn, err := connect(room.hostServerList[room.currentServerIndex].Host, room.hostServerList[room.currentServerIndex].Port)
+			uri := fmt.Sprintf("wss://%v:%v/sub", room.hostServerList[room.currentServerIndex].Host, room.hostServerList[room.currentServerIndex].WssPort)
+			log.Println("尝试创建连接：", uri)
+			headers := http.Header{}
+			headers.Add("Accept-Encoding", "gzip, deflate, br")
+			headers.Add("Accept-Language", "zh-CN,zh;q=0.9,zh-TW;q=0.8,en;q=0.7,ja;q=0.6")
+			headers.Add("Cache-Control", "no-cache")
+			headers.Add("Origin", "https://live.bilibili.com")
+			headers.Add("Pragma", "no-cache")
+			headers.Add("User-Agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36")
+			// 连接到 WSS 服务器
+			c, _, err := websocket.DefaultDialer.Dial(uri, headers)
 			if err != nil {
 				log.Println("connect err:", err)
 				if counter == 3 {
@@ -474,19 +499,46 @@ func (room *liveRoom) createConnect() {
 				counter++
 				continue
 			}
-			room.conn = conn
-			log.Println("连接创建成功：", room.hostServerList[room.currentServerIndex].Host, room.hostServerList[room.currentServerIndex].Port)
-			room.currentServerIndex++
+			room.wsconn = c
+			err = room.auth()
+			if err != nil {
+				fmt.Println(err)
+				room.currentServerIndex++
+				continue
+			}
+			log.Println("连接创建成功：", uri)
 			return
 		}
 	}
 }
 
-func (room *liveRoom) enter() {
-	room.createConnect()
+//
+//func (room *liveRoom) enter() {
+//	room.createConnect()
+//	enterInfo := &enterInfo{
+//		RoomID:   room.realRoomID,
+//		BuVID:    uuid.NewV4().String(), // "91BC0AE5-3142-5334-BDA7-8CF7BB5DE8A180570infoc",
+//		UserID:   int64(room.uid),
+//		ProtoVer: 3,
+//		Platform: "web",
+//		//ClientVer: "1.14.3",
+//		Type: 2,
+//		Key:  room.token,
+//	}
+//	payload, err := json.Marshal(enterInfo)
+//	if err != nil {
+//		log.Println(err)
+//		return
+//	}
+//	room.sendData(WS_OP_USER_AUTHENTICATION, payload)
+//	msg, b, err := room.wsconn.ReadMessage()
+//	log.Println(msg, string(b), err)
+//}
+
+func (room *liveRoom) auth() error {
 	enterInfo := &enterInfo{
 		RoomID:   room.realRoomID,
-		BuVID:    uuid.NewV4().String(),
+		BuVID:    uuid.NewV4().String(), // "91BC0AE5-3142-5334-BDA7-8CF7BB5DE8A180570infoc",
 		UserID:   int64(room.uid),
 		ProtoVer: 3,
 		Platform: "web",
@@ -497,9 +549,18 @@ func (room *liveRoom) enter() {
 	payload, err := json.Marshal(enterInfo)
 	if err != nil {
 		log.Println(err)
-		return
+		return err
 	}
-	room.sendData(WS_OP_USER_AUTHENTICATION, payload)
+	err = room.sendData(WS_OP_USER_AUTHENTICATION, payload)
+	if err != nil {
+		return err
+	}
+	msg, bytes, err := room.wsconn.ReadMessage()
+	log.Println(msg, string(bytes), err)
+	if err != nil {
+		return err
+	}
+	return nil
 }
 
 // 心跳
@@ -510,19 +571,28 @@ func (room *liveRoom) heartBeat(ctx context.Context) {
 			return
 		default:
 		}
-		room.sendData(WS_OP_HEARTBEAT, []byte{})
-		time.Sleep(30 * time.Second)
+		//room.sendData(WS_OP_HEARTBEAT, []byte{})
+		if time.Now().Unix() > room.nextHeartBeatTime {
+			printBytes("up", heartPacket)
+			err := room.wsconn.WriteMessage(websocket.BinaryMessage, heartPacket)
+			if err != nil {
+				log.Println(err)
+			}
+			room.nextHeartBeatTime = time.Now().Unix() + 30
+			room.statusReady = true
+		}
+		time.Sleep(100 * time.Millisecond)
 	}
 }
 
 // 接收消息
 func (room *liveRoom) receive(ctx context.Context, chSocketMessage chan<- *socketMessage) {
 	// 包头总长16个字节
-	headerBuffer := make([]byte, WS_PACKAGE_HEADER_TOTAL_LENGTH)
+	//headerBuffer := make([]byte, WS_PACKAGE_HEADER_TOTAL_LENGTH)
 	// headerBufferReader
 	var headerBufferReader *bytes.Reader
 	// 包体
-	var messageBody []byte
+	//var messageBody []byte
 	counter := 0
 	for {
 		select {
@@ -530,15 +600,23 @@ func (room *liveRoom) receive(ctx context.Context, chSocketMessage chan<- *socke
 			return
 		default:
 		}
-		_, err := io.ReadFull(room.conn, headerBuffer)
+		if !room.statusReady {
+			time.Sleep(time.Millisecond * 100)
+			continue
+		}
+		_, message, err := room.wsconn.ReadMessage()
+		//_, err := io.ReadFull(room.conn, headerBuffer)
 		if err != nil {
 			log.Println("ReadFull: error", err)
-			room.enter()
+			room.createConnect()
 			counter++
 			continue
 		}
+
+		printBytes("down", message)
+
 		var head messageHeader
-		headerBufferReader = bytes.NewReader(headerBuffer)
+		headerBufferReader = bytes.NewReader(message[:WS_PACKAGE_HEADER_TOTAL_LENGTH])
 		_ = binary.Read(headerBufferReader, binary.BigEndian, &head)
 		if head.Length < WS_PACKAGE_HEADER_TOTAL_LENGTH {
 			if counter >= 10 {
@@ -546,30 +624,30 @@ func (room *liveRoom) receive(ctx context.Context, chSocketMessage chan<- *socke
 				log.Println("数据包长度:", head.Length)
 				log.Println("数据包长度不正确")
 			}
-			room.enter()
+			room.createConnect()
 			counter++
 			continue
 		}
-		payloadBuffer := make([]byte, head.Length-WS_PACKAGE_HEADER_TOTAL_LENGTH)
-		_, err = io.ReadFull(room.conn, payloadBuffer)
-		if err != nil {
-			log.Println("ReadFull err:", err)
-			room.enter()
-			counter++
-			continue
-		}
-		messageBody = append(headerBuffer, payloadBuffer...)
+		//payloadBuffer := make([]byte, head.Length-WS_PACKAGE_HEADER_TOTAL_LENGTH)
+		//payloadBuffer := message[WS_PACKAGE_HEADER_TOTAL_LENGTH:]
+		//_, err = io.ReadFull(room.conn, payloadBuffer)
+		//if err != nil {
+		//	log.Println("ReadFull err:", err)
+		//	room.enter()
+		//	counter++
+		//	continue
+		//}
+		//messageBody = append(headerBuffer, payloadBuffer...)
 		chSocketMessage <- &socketMessage{
 			roomID: room.roomID,
-			body:   messageBody,
+			body:   message,
 		}
 		counter = 0
 	}
 }
 
 // 发送数据
-func (room *liveRoom) sendData(operation int32, payload []byte) {
-
+func (room *liveRoom) sendData(operation int32, payload []byte) error {
 	b := bytes.NewBuffer([]byte{})
 	head := messageHeader{
 		Length:          int32(len(payload)) + WS_PACKAGE_HEADER_TOTAL_LENGTH,
@@ -580,18 +658,18 @@ func (room *liveRoom) sendData(operation int32, payload []byte) {
 	}
 	err := binary.Write(b, binary.BigEndian, head)
 	if err != nil {
-		log.Println(err)
+		return err
 	}
-
 	err = binary.Write(b, binary.LittleEndian, payload)
 	if err != nil {
-		log.Println(err)
+		return err
 	}
-
-	_, err = room.conn.Write(b.Bytes())
+	printBytes("up", b.Bytes())
+	err = room.wsconn.WriteMessage(websocket.BinaryMessage, b.Bytes())
 	if err != nil {
-		log.Println(err)
+		return err
 	}
+	return nil
 }
 
 func connect(host string, port int) (*net.TCPConn, error) {
@@ -627,4 +705,18 @@ func doBrotliUnCompress(compressSrc []byte) []byte {
 		return []byte{}
 	}
 	return bs
+}
+
+func printBytes(direct string, bytes []byte) {
+	fmt.Println(direct, len(bytes))
+	// 迭代字节数组并按照格式打印
+	for i, b := range bytes {
+		if i%16 == 0 && i > 0 {
+			fmt.Println()
+		} else if i%2 == 0 && i > 0 {
+			fmt.Print(" ")
+		}
+		fmt.Printf("%02x", b)
+	}
+	fmt.Println()
 }

@@ -2,7 +2,7 @@ package bililive
 
 import (
 	"context"
-	"net"
+	"github.com/gorilla/websocket"
 	"sync"
 )
 
@@ -48,16 +48,19 @@ type socketMessage struct {
 }
 
 type liveRoom struct {
-	roomID             int // 房间ID（兼容短ID）
-	realRoomID         int
-	uid                int
-	cancel             context.CancelFunc
-	server             string // 地址
-	port               int    // 端口
+	roomID     int // 房间ID（兼容短ID）
+	realRoomID int
+	uid        int
+	cancel     context.CancelFunc
+	//server             string // 地址
+	//port               int    // 端口
 	hostServerList     []*hostServerList
 	currentServerIndex int
 	token              string // key
-	conn               *net.TCPConn
+	//conn               *net.TCPConn
+	wsconn            *websocket.Conn
+	nextHeartBeatTime int64
+	statusReady       bool
 }
 
 type messageHeader struct {
@@ -115,6 +118,26 @@ type hostServerList struct {
 	Port    int    `json:"port"`
 	WssPort int    `json:"wss_port"`
 	WsPort  int    `json:"ws_port"`
+}
+
+type danmuServerV2Resp struct {
+	Code    int    `json:"code"`
+	Message string `json:"message"`
+	Ttl     int    `json:"ttl"`
+	Data    struct {
+		Group            string  `json:"group"`
+		BusinessId       int     `json:"business_id"`
+		RefreshRowFactor float64 `json:"refresh_row_factor"`
+		RefreshRate      int     `json:"refresh_rate"`
+		MaxDelay         int     `json:"max_delay"`
+		Token            string  `json:"token"`
+		HostList         []struct {
+			Host    string `json:"host"`
+			Port    int    `json:"port"`
+			WssPort int    `json:"wss_port"`
+			WsPort  int    `json:"ws_port"`
+		} `json:"host_list"`
+	} `json:"data"`
 }
 
 // 命令模型
