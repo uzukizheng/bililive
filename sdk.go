@@ -149,6 +149,15 @@ func (live *Live) Rooms() []int {
 	return roomIDs
 }
 
+func (live *Live) Status(roomID int) int {
+	live.lock.Lock()
+	defer live.lock.Unlock()
+	if room := live.room[roomID]; room != nil {
+		return room.status
+	}
+	return 0
+}
+
 // 拆分数据
 func (live *Live) split(ctx context.Context) {
 	var (
@@ -521,6 +530,7 @@ func (room *liveRoom) enter() {
 		return
 	}
 	room.sendData(WS_OP_USER_AUTHENTICATION, payload)
+	room.status = 1
 }
 
 // 心跳
@@ -554,6 +564,8 @@ func (room *liveRoom) receive(ctx context.Context, chSocketMessage chan<- *socke
 		_, err := io.ReadFull(room.conn, headerBuffer)
 		if err != nil {
 			log.Println("ReadFull: error", err)
+			room.status = -1
+			time.Sleep(time.Second * 60)
 			room.enter()
 			counter++
 			continue
@@ -567,6 +579,8 @@ func (room *liveRoom) receive(ctx context.Context, chSocketMessage chan<- *socke
 				log.Println("数据包长度:", head.Length)
 				log.Println("数据包长度不正确")
 			}
+			room.status = -2
+			time.Sleep(time.Second * 60)
 			room.enter()
 			counter++
 			continue
@@ -574,7 +588,9 @@ func (room *liveRoom) receive(ctx context.Context, chSocketMessage chan<- *socke
 		payloadBuffer := make([]byte, head.Length-WS_PACKAGE_HEADER_TOTAL_LENGTH)
 		_, err = io.ReadFull(room.conn, payloadBuffer)
 		if err != nil {
+			room.status = -3
 			log.Println("ReadFull err:", err)
+			time.Sleep(time.Second * 60)
 			room.enter()
 			counter++
 			continue

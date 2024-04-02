@@ -74,6 +74,7 @@ type liveRoom struct {
 	conn               *net.TCPConn
 	viewerUID          int
 	viewerCookie       string
+	status             int
 }
 
 type messageHeader struct {
