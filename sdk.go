@@ -102,7 +102,6 @@ func (live *Live) JoinWithLogin(viewerUID int, viewerCookie string, roomIDs ...i
 
 	for _, roomID := range roomIDs {
 		nextCtx, cancel := context.WithCancel(live.ctx)
-
 		room := &liveRoom{
 			roomID:       roomID,
 			cancel:       cancel,
@@ -110,10 +109,12 @@ func (live *Live) JoinWithLogin(viewerUID int, viewerCookie string, roomIDs ...i
 			viewerCookie: viewerCookie,
 		}
 		live.room[roomID] = room
-		room.enter()
-		go room.heartBeat(nextCtx)
 		live.stormContent[roomID] = make(map[int64]string)
-		go room.receive(nextCtx, live.chSocketMessage)
+		go func() {
+			room.enter()
+			go room.heartBeat(nextCtx)
+			go room.receive(nextCtx, live.chSocketMessage)
+		}()
 	}
 	return nil
 }
