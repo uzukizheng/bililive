@@ -452,7 +452,6 @@ func (room *liveRoom) findServer() error {
 	if err != nil {
 		return err
 	}
-
 	danmuInfo := danmuInfoResp{}
 	_ = json.Unmarshal(rspDanmuInfo, &danmuInfo)
 	if danmuInfo.Code != 0 {
@@ -541,6 +540,9 @@ func (room *liveRoom) heartBeat(ctx context.Context) {
 			return
 		default:
 		}
+		if room.status == -4 {
+			return
+		}
 		room.sendData(WS_OP_HEARTBEAT, []byte{})
 		time.Sleep(30 * time.Second)
 	}
@@ -563,13 +565,21 @@ func (room *liveRoom) receive(ctx context.Context, chSocketMessage chan<- *socke
 		}
 		_, err := io.ReadFull(room.conn, headerBuffer)
 		if err != nil {
-			log.Println("ReadFull: error", err)
-			room.status = -1
+			log.Println("ReadFull: error", room.roomID, err)
+			if room.status == 1 {
+				// 初始读
+				room.status = -4
+				log.Println("连接认证失败", room.roomID)
+				return
+			} else {
+				room.status = -1
+			}
 			time.Sleep(time.Second * 60)
 			room.enter()
 			counter++
 			continue
 		}
+		room.status = 2
 		var head messageHeader
 		headerBufferReader = bytes.NewReader(headerBuffer)
 		_ = binary.Read(headerBufferReader, binary.BigEndian, &head)
